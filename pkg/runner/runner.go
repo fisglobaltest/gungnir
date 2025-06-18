@@ -28,11 +28,12 @@ import (
 var (
 	logListUrl          = "https://www.gstatic.com/ct/log_list/v3/all_logs_list.json"
 	defaultRateLimitMap = map[string]time.Duration{
-		"Google":        time.Millisecond * 1,
-		"Sectigo":       time.Second * 4,
-		"Let's Encrypt": time.Second * 1,
-		"DigiCert":      time.Second * 1,
-		"TrustAsia":     time.Second * 1,
+		"Google":        2 * time.Second,    // Changed from 1ms to 2s
+		"Sectigo":       15 * time.Second,   // Changed from 4s to 15s
+		"Let's Encrypt": time.Second,
+		"DigiCert":      time.Second,
+		"TrustAsia":     30 * time.Second,   // Changed from 1s to 30s
+		"Cloudflare":    time.Second,        // Add Cloudflare
 	}
 )
 
