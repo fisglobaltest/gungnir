@@ -50,22 +50,24 @@ func RetryGetEntries(ctx context.Context, client *client.LogClient, start, end i
 }
 
 func shouldRetry(errStr string) bool {
-	retryableErrors := []string{
-		"504", "502", "503", "429", "500",
-		"timeout", "deadline exceeded",
-		"connection refused", "connection reset",
-	}
-	
-	for _, e := range retryableErrors {
-		if strings.Contains(errStr, e) {
-			return true
-		}
-	}
-	
-	// TrustAsia special case
-	if strings.Contains(errStr, "400") && strings.Contains(errStr, "trustasia") {
-		return true
-	}
-	
-	return false
+    retryableErrors := []string{
+        "504", "502", "503", "429", "500",
+        "timeout", "deadline exceeded",
+        "connection refused", "connection reset",
+        "unexpected eof",  // ADD THIS LINE
+        "eof",            // ADD THIS LINE
+    }
+    
+    for _, e := range retryableErrors {
+        if strings.Contains(errStr, e) {
+            return true
+        }
+    }
+    
+    // TrustAsia special case
+    if strings.Contains(errStr, "400") && strings.Contains(errStr, "trustasia") {
+        return true
+    }
+    
+    return false
 }
