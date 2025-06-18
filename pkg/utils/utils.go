@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/g0ldencybersec/gungnir/pkg/types"
+	"github.com/fisglobaltest/gungnir/pkg/types"
 	"github.com/google/certificate-transparency-go/loglist3"
 	"github.com/google/certificate-transparency-go/x509"
 	"github.com/google/uuid"
