@@ -13,7 +13,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-
 	"github.com/anthdm/hollywood/actor"
 	"github.com/g0ldencybersec/gungnir/pkg/utils"
 	ct "github.com/google/certificate-transparency-go"
