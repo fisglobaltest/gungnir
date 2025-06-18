@@ -75,7 +75,11 @@ func createLogClient(key []byte, url string) (*client.LogClient, error) {
 	// CRITICAL: Increase timeout based on provider
 	timeout := 90 * time.Second // Default
 	if strings.Contains(url, "sectigo") {
-		timeout = 120 * time.Second // Longer for Sectigo
+	    timeout = 120 * time.Second // Longer for Sectigo
+	} else if strings.Contains(url, "googleapis.com") {
+	    timeout = 120 * time.Second // Google also needs longer timeout
+	} else if strings.Contains(url, "cloudflare") {
+	    timeout = 100 * time.Second // Cloudflare needs more time
 	}
 	
 	httpClient := &http.Client{
