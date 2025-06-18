@@ -28,12 +28,17 @@ import (
 var (
 	logListUrl          = "https://www.gstatic.com/ct/log_list/v3/all_logs_list.json"
 	defaultRateLimitMap = map[string]time.Duration{
-		"Google":        2 * time.Second,    // Changed from 1ms to 2s
-		"Sectigo":       15 * time.Second,   // Changed from 4s to 15s
-		"Let's Encrypt": time.Second,
-		"DigiCert":      time.Second,
-		"TrustAsia":     30 * time.Second,   // Changed from 1s to 30s
-		"Cloudflare":    time.Second,        // Add Cloudflare
+	    "Google":        2 * time.Second,
+	    "Sectigo":       15 * time.Second,
+	    "Let's Encrypt": time.Second,
+	    "DigiCert":      time.Second,
+	    "TrustAsia":     30 * time.Second,
+	    "Cloudflare":    time.Second,
+	    "Argon":         3 * time.Second,     // Add Google Argon logs
+	    "Xenon":         3 * time.Second,     // Add Google Xenon logs  
+	    "Nimbus":        time.Second,         // Cloudflare Nimbus
+	    "Mammoth":       15 * time.Second,    // Sectigo Mammoth
+	    "Sabre":         15 * time.Second,    // Sectigo Sabre
 	}
 )
 
@@ -52,6 +57,8 @@ type Runner struct {
 	actorPID       *actor.PID
 	useActor       bool
 	actorEngine    *actor.Engine
+	backoffTracker map[string]time.Time
+	backoffMutex   sync.RWMutex
 }
 
 func (r *Runner) loadRootDomains() error {
@@ -117,6 +124,7 @@ func NewRunner(options *Options) (*Runner, error) {
 		options:     options,
 		rootDomains: make(map[string]bool),
 		restartChan: make(chan struct{}),
+		backoffTracker: make(map[string]time.Time),
 	}
 
 	if err := runner.loadRootDomains(); err != nil {
@@ -273,11 +281,23 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 	}
 
 	tickerDuration := time.Second // Default duration
-	for key := range r.rateLimitMap {
-		if strings.Contains(ctl.Name, key) {
-			tickerDuration = r.rateLimitMap[key]
+	// Determine ticker duration based on log name or URL
+	tickerDuration := time.Second // Default duration
+	logNameLower := strings.ToLower(ctl.Name)
+	logURL := strings.ToLower(ctl.Client.BaseURI())
+
+	// Check both name and URL for matches
+	for key, duration := range r.rateLimitMap {
+		keyLower := strings.ToLower(key)
+		if strings.Contains(logNameLower, keyLower) || strings.Contains(logURL, keyLower) {
+			tickerDuration = duration
 			break
 		}
+	}
+
+	// Special handling for specific problematic logs
+	if strings.Contains(logURL, "429") || strings.Contains(logNameLower, "sabre") {
+		tickerDuration = 20 * time.Second // Even slower for heavily rate-limited logs
 	}
 
 	// Is this a google log?
@@ -345,25 +365,44 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if start >= end {
+			if start >= end {				
 				if err = r.fetchAndUpdateSTH(ctx, ctl, &end); err != nil {
 					if r.options.Verbose {
-						fmt.Fprintf(os.Stderr, "Failed to update STH: %v\n", err)
+						fmt.Fprintf(os.Stderr, "Failed to update STH for %s: %v\n", ctl.Name, err)
 					}
+					
+					// Determine wait time based on error type and provider
+					waitTime := 60 * time.Second // Default longer wait for STH errors
+					errStr := strings.ToLower(err.Error())
+					
+					// Special handling for known error patterns
+					if strings.Contains(errStr, "504") || strings.Contains(errStr, "timeout") {
+						waitTime = 120 * time.Second
+						if strings.Contains(ctl.Name, "Sectigo") {
+							waitTime = 180 * time.Second // 3 minutes for Sectigo
+						}
+					} else if strings.Contains(errStr, "429") {
+						// For 429 on STH, back off significantly
+						waitTime = 5 * time.Minute
+						if r.options.Verbose {
+							fmt.Fprintf(os.Stderr, "Rate limited on STH for %s, backing off for 5 minutes\n", ctl.Name)
+						}
+					} else if strings.Contains(errStr, "500") {
+						// Server error - wait longer
+						waitTime = 2 * time.Minute
+					}
+					
+					if r.options.Verbose {
+						fmt.Fprintf(os.Stderr, "Waiting %v before retrying STH for %s\n", waitTime, ctl.Name)
+					}
+					
 					select {
 					case <-ctx.Done():
 						return
-					case <-time.After(60 * time.Second): // Wait with context awareness
+					case <-time.After(waitTime):
 					}
 					continue
 				}
-				if r.options.Debug {
-					if end-start > 25 {
-						fmt.Fprintf(os.Stderr, "%s is behind by: %d\n", ctl.Name, end-start)
-					}
-				}
-				continue
-			}
 
 			// Work with google logs
 			if IsGoogleLog {
@@ -396,6 +435,18 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 								waitTime = 5*time.Minute
 							}
 						}
+						// Right after the waitTime calculation, ADD:
+						r.backoffMutex.Lock()
+						lastError, exists := r.backoffTracker[ctl.Name]
+						if exists && time.Since(lastError) < 5*time.Minute {
+							// Recently had an error, double the wait time
+							waitTime = waitTime * 2
+							if r.options.Verbose {
+								fmt.Fprintf(os.Stderr, "Recent errors detected for %s, doubling wait time to %v\n", ctl.Name, waitTime)
+							}
+						}
+						r.backoffTracker[ctl.Name] = time.Now()
+						r.backoffMutex.Unlock()
 						
 						if r.options.Verbose {
 							fmt.Fprintf(os.Stderr, "Waiting %v before retrying %s\n", waitTime, ctl.Name)
@@ -449,6 +500,18 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 							waitTime = 5*time.Minute
 						}
 					}
+					// Right after the waitTime calculation, ADD:
+					r.backoffMutex.Lock()
+					lastError, exists := r.backoffTracker[ctl.Name]
+					if exists && time.Since(lastError) < 5*time.Minute {
+						// Recently had an error, double the wait time
+						waitTime = waitTime * 2
+						if r.options.Verbose {
+							fmt.Fprintf(os.Stderr, "Recent errors detected for %s, doubling wait time to %v\n", ctl.Name, waitTime)
+						}
+					}
+					r.backoffTracker[ctl.Name] = time.Now()
+					r.backoffMutex.Unlock()
 					
 					if r.options.Verbose {
 						fmt.Fprintf(os.Stderr, "Waiting %v before retrying %s\n", waitTime, ctl.Name)
