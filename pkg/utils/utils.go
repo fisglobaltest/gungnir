@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
@@ -10,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"    // ADDED
 	"time"
 
 	"github.com/g0ldencybersec/gungnir/pkg/types"
@@ -20,6 +22,18 @@ import (
 	"github.com/google/certificate-transparency-go/client"
 	"github.com/google/certificate-transparency-go/jsonclient"
 )
+
+// ADDED: Rate limiting configuration
+var logDelays = map[string]time.Duration{
+	"ct.sectigo.com":     15 * time.Second,  // Very slow - frequent 504 errors
+	"ct.trustasia.com":   30 * time.Second,  // Extremely slow - 400 errors
+	"ct.googleapis.com":  2 * time.Second,   // Moderate - complex rate limiting
+	"ct.cloudflare.com":  1 * time.Second,   // Fast - generous limits
+	"ct.letsencrypt.org": 1 * time.Second,   // Fast - reliable
+	"ct.digicert.com":    1 * time.Second,   // Fast - documented limits
+}
+
+var lastRequest = sync.Map{} // ADDED: Track when we last hit each log
 
 var getByScheme = map[string]func(*url.URL) ([]byte, error){
 	"http":  readHTTP,
@@ -49,24 +63,35 @@ func readURL(u *url.URL) ([]byte, error) {
 }
 
 // createLogClient creates a CT log client from a public key and URL.
+// MODIFIED: Increased timeout and improved error handling
 func createLogClient(key []byte, url string) (*client.LogClient, error) {
 	pemPK := pem.EncodeToMemory(&pem.Block{
 		Type:  "PUBLIC KEY",
 		Bytes: key,
 	})
 	opts := jsonclient.Options{PublicKey: string(pemPK), UserAgent: "gungnir-" + uuid.New().String()}
-	c, err := client.New(url, &http.Client{
-		Timeout: 27 * time.Second,
-		Transport: &http.Transport{
-			TLSHandshakeTimeout:   30 * time.Second,
-			ResponseHeaderTimeout: 30 * time.Second,
-			MaxIdleConnsPerHost:   10,
-			DisableKeepAlives:     false,
-			MaxIdleConns:          100,
-			IdleConnTimeout:       90 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		},
-	}, opts)
+	
+	// ENHANCED: Better transport configuration with longer timeouts
+	transport := &http.Transport{
+		// CRITICAL FIX: Disable HTTP/2 to prevent context cancellation deadlock
+		TLSNextProto: make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
+		
+		// INCREASED timeouts for better reliability
+		TLSHandshakeTimeout:   45 * time.Second,  // Increased from 30s
+		ResponseHeaderTimeout: 60 * time.Second,  // Increased from 30s
+		MaxIdleConnsPerHost:   3,                 // Reduced from 10 to be gentler
+		DisableKeepAlives:     false,             // Enable keep-alives for efficiency
+		MaxIdleConns:          20,                // Reduced from 100
+		IdleConnTimeout:       60 * time.Second,  // Reduced from 90s
+		ExpectContinueTimeout: 2 * time.Second,   // Increased from 1s
+	}
+	
+	httpClient := &http.Client{
+		Timeout:   90 * time.Second,  // CRITICAL: Increased from 27s to 90s
+		Transport: transport,
+	}
+	
+	c, err := client.New(url, httpClient, opts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create JSON client: %v", err)
 	}
@@ -137,4 +162,78 @@ func JsonOutput(cert *x509.Certificate) {
 	}
 	outputJson, _ := json.Marshal(certInfo)
 	fmt.Println(string(outputJson))
+}
+
+// ADDED: Rate limiting function to wait before hitting CT logs
+func WaitForLog(logURL string) {
+	// Figure out which provider this is and get appropriate delay
+	var delay time.Duration = 2 * time.Second // default delay
+	
+	for provider, providerDelay := range logDelays {
+		if strings.Contains(logURL, provider) {
+			delay = providerDelay
+			break
+		}
+	}
+	
+	// Check when we last hit this provider
+	if lastTime, exists := lastRequest.Load(logURL); exists {
+		timeSince := time.Since(lastTime.(time.Time))
+		if timeSince < delay {
+			waitTime := delay - timeSince
+			fmt.Printf("[RATE LIMIT] Waiting %v before hitting %s\n", waitTime, extractHostname(logURL))
+			time.Sleep(waitTime)
+		}
+	}
+	
+	// Record this request time
+	lastRequest.Store(logURL, time.Now())
+}
+
+// ADDED: Helper function to extract hostname for cleaner logging
+func extractHostname(url string) string {
+	if strings.Contains(url, "://") {
+		parts := strings.Split(url, "://")
+		if len(parts) > 1 {
+			hostPart := strings.Split(parts[1], "/")[0]
+			return hostPart
+		}
+	}
+	return url
+}
+
+// ADDED: Function to check if we should retry an error
+func ShouldRetryError(err error) bool {
+	if err == nil {
+		return false
+	}
+	
+	errStr := strings.ToLower(err.Error())
+	
+	// Retryable errors
+	retryableErrors := []string{
+		"504",                    // Gateway Timeout (Sectigo)
+		"502",                    // Bad Gateway
+		"503",                    // Service Unavailable
+		"429",                    // Too Many Requests
+		"500",                    // Internal Server Error
+		"timeout",                // Any timeout
+		"context deadline exceeded",
+		"connection refused",
+		"connection reset",
+		"network is unreachable",
+	}
+	
+	for _, retryableErr := range retryableErrors {
+		if strings.Contains(errStr, retryableErr) {
+			return true
+		}
+	}
+	
+	// TrustAsia returns 400 for rate limiting (non-standard)
+	if strings.Contains(errStr, "400") && strings.Contains(errStr, "trustasia") {
+		return true
+	}
+	
+	return false
 }
