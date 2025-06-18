@@ -357,11 +357,17 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 		break
 	}
 
-	// After the initial STH fetch loop
-	if end > 20 {
-		start = end - 20
+	// Initialize start position more carefully
+	if end > 1000 {
+		start = end - 1000  // Start 1000 entries back for active logs
+	} else if end > 20 {
+		start = end - 20    // Start 20 entries back for smaller logs
 	} else {
-		start = 0
+		start = 0          // Start from beginning for very small logs
+	}
+
+	if r.options.Verbose {
+		fmt.Fprintf(os.Stderr, "[INIT] %s: Starting scan from %d to %d\n", ctl.Name, start, end)
 	}
 
 	for {
@@ -416,19 +422,29 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 					if batchEnd > end {
 						batchEnd = end
 					}
-					// Make sure we're not requesting invalid range
-					if start >= batchEnd {
-						break
+					
+					// Log the request details
+					if r.options.Verbose {
+						fmt.Fprintf(os.Stderr, "[DEBUG] %s: Requesting entries [%d:%d] (batch size: %d)\n", 
+							ctl.Name, start, batchEnd-1, batchEnd-start)
 					}
-					entries, err := RetryGetEntries(ctx, ctl.Client, start, batchEnd-1, 3)  // Note: batchEnd-1
+					
+					entries, err := RetryGetEntries(ctx, ctl.Client, start, batchEnd-1, 3)
 					if err != nil {
-						if r.options.Verbose {
-							fmt.Fprintf(os.Stderr, "Error fetching entries for %s (%s): %v\n", ctl.Name, providerName, err)
-						}
+						// Enhanced error logging
+						fmt.Fprintf(os.Stderr, "Error fetching entries for %s (%s): %v\n", ctl.Name, providerName, err)
+						fmt.Fprintf(os.Stderr, "[ERROR DETAILS] Log: %s, URL: %s, Range: [%d:%d], Batch Size: %d\n", 
+							ctl.Name, ctl.Client.BaseURI(), start, batchEnd-1, batchEnd-start)
 						
 						// Determine wait time based on error type and provider
 						waitTime := 30 * time.Second
 						errStr := strings.ToLower(err.Error())
+						
+						// Check for specific error types
+						if strings.Contains(errStr, "400") {
+							fmt.Fprintf(os.Stderr, "[400 ERROR] This usually means invalid parameters. Current end: %d, start: %d, batchEnd: %d\n", 
+								end, start, batchEnd)
+						}
 						
 						// Special handling for known error patterns
 						if strings.Contains(errStr, "504") || strings.Contains(errStr, "timeout") {
@@ -444,7 +460,8 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 								waitTime = 5*time.Minute
 							}
 						}
-						// Right after the waitTime calculation, ADD:
+						
+						// Backoff tracker
 						r.backoffMutex.Lock()
 						lastError, exists := r.backoffTracker[ctl.Name]
 						if exists && time.Since(lastError) < 5*time.Minute {
@@ -466,37 +483,75 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 							return
 						case <-time.After(waitTime):
 						}
-						break // This should be INSIDE the if err != nil block
+						break // Break the inner loop on error
 					}
 
 					if len(entries.Entries) > 0 {
+						if r.options.Verbose {
+							fmt.Fprintf(os.Stderr, "[SUCCESS] %s: Got %d entries\n", ctl.Name, len(entries.Entries))
+						}
 						r.entryTasksChan <- types.EntryTask{
 							Entries: entries,
 							Index:   start,
 						}
 						start += int64(len(entries.Entries))
 					} else {
-						break // No more entries to process, break the loop.
+						if r.options.Verbose {
+							fmt.Fprintf(os.Stderr, "[INFO] %s: No entries returned for range [%d:%d]\n", 
+								ctl.Name, start, batchEnd-1)
+						}
+						break // No more entries to process, break the loop
 					}
 				}
-				continue // Continue with the outer loop.
+				continue // Continue with the outer ticker loop
 			} else { // Non Google handler
 				batchEnd := start + batchSize
 				if batchEnd > end {
 					batchEnd = end
 				}
-				if start >= batchEnd {
-					continue // Skip this iteration if we've caught up
+				
+				// Log the request details
+				if r.options.Verbose {
+					fmt.Fprintf(os.Stderr, "[DEBUG] %s: Requesting entries [%d:%d] (batch size: %d)\n", 
+						ctl.Name, start, batchEnd-1, batchEnd-start)
 				}
+				
+				// Check if the range is valid before making request
+				if start >= end {
+					if r.options.Verbose {
+						fmt.Fprintf(os.Stderr, "[INFO] %s: Already caught up (start: %d >= end: %d)\n", 
+							ctl.Name, start, end)
+					}
+					continue
+				}
+				
 				entries, err := RetryGetEntries(ctx, ctl.Client, start, batchEnd-1, 3)
 				if err != nil {
-					if r.options.Verbose {
-						fmt.Fprintf(os.Stderr, "Error fetching entries for %s (%s): %v\n", ctl.Name, providerName, err)
-					}
+					// Enhanced error logging
+					fmt.Fprintf(os.Stderr, "Error fetching entries for %s (%s): %v\n", ctl.Name, providerName, err)
+					fmt.Fprintf(os.Stderr, "[ERROR DETAILS] Log: %s, URL: %s, Range: [%d:%d], Batch Size: %d\n", 
+						ctl.Name, ctl.Client.BaseURI(), start, batchEnd-1, batchEnd-start)
 					
 					// Determine wait time based on error type and provider
 					waitTime := 30 * time.Second
 					errStr := strings.ToLower(err.Error())
+					
+					// Check for specific error types
+					if strings.Contains(errStr, "400") {
+						fmt.Fprintf(os.Stderr, "[400 ERROR] This usually means invalid parameters. Current end: %d, start: %d, batchEnd: %d\n", 
+							end, start, batchEnd)
+						
+						// Try to diagnose the issue
+						if start > end {
+							fmt.Fprintf(os.Stderr, "[DIAGNOSIS] start > end, this is invalid\n")
+						}
+						if batchEnd-1 < start {
+							fmt.Fprintf(os.Stderr, "[DIAGNOSIS] batchEnd-1 < start, this is invalid\n")
+						}
+						if batchEnd-start > 1000 {
+							fmt.Fprintf(os.Stderr, "[DIAGNOSIS] Batch size might be too large\n")
+						}
+					}
 					
 					// Special handling for known error patterns
 					if strings.Contains(errStr, "504") || strings.Contains(errStr, "timeout") {
@@ -512,7 +567,8 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 							waitTime = 5*time.Minute
 						}
 					}
-					// Right after the waitTime calculation, ADD:
+					
+					// Backoff tracker
 					r.backoffMutex.Lock()
 					lastError, exists := r.backoffTracker[ctl.Name]
 					if exists && time.Since(lastError) < 5*time.Minute {
@@ -534,16 +590,24 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 						return
 					case <-time.After(waitTime):
 					}
-					continue // Add this line to continue the outer loop
+					continue // Continue the outer ticker loop
 				}
 
 				if len(entries.Entries) > 0 {
+					if r.options.Verbose {
+						fmt.Fprintf(os.Stderr, "[SUCCESS] %s: Got %d entries\n", ctl.Name, len(entries.Entries))
+					}
 					r.entryTasksChan <- types.EntryTask{
 						Entries: entries,
 						Index:   start,
 					}
 					start += int64(len(entries.Entries))
-				} else {// No entries returned, advance start to avoid infinite loop
+				} else {
+					if r.options.Verbose {
+						fmt.Fprintf(os.Stderr, "[INFO] %s: No entries returned for range [%d:%d]\n", 
+							ctl.Name, start, batchEnd-1)
+					}
+					// Move forward to avoid getting stuck
 					start = batchEnd
 				}
 			}
