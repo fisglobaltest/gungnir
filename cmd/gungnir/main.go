@@ -3,7 +3,7 @@ package main
 import (
 	"log"
 
-	"github.com/g0ldencybersec/gungnir/pkg/runner"
+	"github.com/fisglobaltest/gungnir/pkg/runner"
 )
 
 func main() {
