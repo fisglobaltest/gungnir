@@ -49,24 +49,41 @@ func readURL(u *url.URL) ([]byte, error) {
 }
 
 // createLogClient creates a CT log client from a public key and URL.
+// REPLACE the existing createLogClient function with this enhanced version:
 func createLogClient(key []byte, url string) (*client.LogClient, error) {
 	pemPK := pem.EncodeToMemory(&pem.Block{
 		Type:  "PUBLIC KEY",
 		Bytes: key,
 	})
 	opts := jsonclient.Options{PublicKey: string(pemPK), UserAgent: "gungnir-" + uuid.New().String()}
-	c, err := client.New(url, &http.Client{
-		Timeout: 27 * time.Second,
-		Transport: &http.Transport{
-			TLSHandshakeTimeout:   30 * time.Second,
-			ResponseHeaderTimeout: 30 * time.Second,
-			MaxIdleConnsPerHost:   10,
-			DisableKeepAlives:     false,
-			MaxIdleConns:          100,
-			IdleConnTimeout:       90 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		},
-	}, opts)
+	
+	// ENHANCED: Better transport configuration with longer timeouts
+	transport := &http.Transport{
+		// CRITICAL FIX: Disable HTTP/2 to prevent context cancellation deadlock
+		TLSNextProto: make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
+		
+		// INCREASED timeouts for better reliability
+		TLSHandshakeTimeout:   45 * time.Second,  // Increased from 30s
+		ResponseHeaderTimeout: 60 * time.Second,  // Increased from 30s
+		MaxIdleConnsPerHost:   3,                 // Reduced from 10 to be gentler
+		DisableKeepAlives:     false,             // Enable keep-alives for efficiency
+		MaxIdleConns:          20,                // Reduced from 100
+		IdleConnTimeout:       60 * time.Second,  // Reduced from 90s
+		ExpectContinueTimeout: 2 * time.Second,   // Increased from 1s
+	}
+	
+	// CRITICAL: Increase timeout based on provider
+	timeout := 90 * time.Second // Default
+	if strings.Contains(url, "sectigo") {
+		timeout = 120 * time.Second // Longer for Sectigo
+	}
+	
+	httpClient := &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
+	}
+	
+	c, err := client.New(url, httpClient, opts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create JSON client: %v", err)
 	}
