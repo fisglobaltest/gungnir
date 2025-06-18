@@ -175,6 +175,30 @@ func NewRunner(options *Options) (*Runner, error) {
 
 	return runner, nil
 }
+
+
+// Add this function to help identify which provider we're dealing with
+func getProviderName(logURL string) string {
+	logURL = strings.ToLower(logURL)
+	switch {
+	case strings.Contains(logURL, "googleapis"):
+		return "Google"
+	case strings.Contains(logURL, "sectigo"):
+		return "Sectigo"  
+	case strings.Contains(logURL, "trustasia"):
+		return "TrustAsia"
+	case strings.Contains(logURL, "cloudflare"):
+		return "Cloudflare"
+	case strings.Contains(logURL, "letsencrypt"):
+		return "Let's Encrypt"
+	case strings.Contains(logURL, "digicert"):
+		return "DigiCert"
+	default:
+		return "Unknown"
+	}
+}
+
+
 func (r *Runner) Run() {
 	var wg sync.WaitGroup
 	ctx, cancel := context.WithCancel(context.Background())
@@ -242,6 +266,11 @@ func (r *Runner) entryWorker(ctx context.Context) {
 
 func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGroup) {
 	defer wg.Done()
+	// Identify the provider for better logging
+	providerName := getProviderName(ctl.Client.BaseURI())
+	if r.options.Verbose {
+		fmt.Fprintf(os.Stderr, "Starting scan for %s (%s)\n", ctl.Name, providerName)
+	}
 
 	tickerDuration := time.Second // Default duration
 	for key := range r.rateLimitMap {
@@ -253,6 +282,15 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 
 	// Is this a google log?
 	IsGoogleLog := strings.Contains(ctl.Name, "Google")
+	// Determine batch size based on provider
+	batchSize := int64(256) // Default
+	if strings.Contains(ctl.Name, "Sectigo") {
+		batchSize = 50
+	} else if strings.Contains(ctl.Name, "TrustAsia") {
+		batchSize = 20
+	} else if strings.Contains(ctl.Name, "Google") {
+		batchSize = 31
+	}
 
 	ticker := time.NewTicker(tickerDuration)
 	defer ticker.Stop()
@@ -264,14 +302,38 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 	for retries := 0; retries < 3; retries++ {
 		if err = r.fetchAndUpdateSTH(ctx, ctl, &end); err != nil {
 			if r.options.Verbose {
-				fmt.Fprintf(os.Stderr, "Retry %d: Failed to get initial STH for log %s: %v\n", retries+1, ctl.Client.BaseURI(), err)
+				fmt.Fprintf(os.Stderr, "Failed to update STH for %s: %v\n", ctl.Name, err)
 			}
+			
+			// Determine wait time based on error type and provider
+			waitTime := 30 * time.Second
+			errStr := strings.ToLower(err.Error())
+			
+			// Special handling for known error patterns
+			if strings.Contains(errStr, "504") || strings.Contains(errStr, "timeout") {
+				waitTime = 60 * time.Second
+				if strings.Contains(ctl.Name, "Sectigo") {
+					waitTime = 120 * time.Second
+				}
+			} else if strings.Contains(errStr, "429") || 
+					(strings.Contains(errStr, "400") && strings.Contains(ctl.Name, "TrustAsia")) {
+				// Rate limiting - use exponential backoff
+				waitTime = tickerDuration * 2
+				if waitTime > 5*time.Minute {
+					waitTime = 5*time.Minute
+				}
+			}
+			
+			if r.options.Verbose {
+				fmt.Fprintf(os.Stderr, "Waiting %v before retrying %s\n", waitTime, ctl.Name)
+			}
+			
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(60 * time.Second): // Wait with context awareness
-				continue
+			case <-time.After(waitTime):
 			}
+			continue
 		}
 		break
 	}
@@ -306,21 +368,45 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 			// Work with google logs
 			if IsGoogleLog {
 				for start < end {
-					batchEnd := start + 32
+					batchEnd := start + batchSize
 					if batchEnd > end {
 						batchEnd = end
 					}
-					entries, err := ctl.Client.GetRawEntries(ctx, start, batchEnd)
+					entries, err := RetryGetEntries(ctx, ctl.Client, start, batchEnd, 3)
 					if err != nil {
 						if r.options.Verbose {
-							fmt.Fprintf(os.Stderr, "Error fetching entries for %s: %v", ctl.Name, err)
+							fmt.Fprintf(os.Stderr, "Error fetching entries for %s (%s): %v\n", ctl.Name, providerName, err)
 						}
+						
+						// Determine wait time based on error type and provider
+						waitTime := 30 * time.Second
+						errStr := strings.ToLower(err.Error())
+						
+						// Special handling for known error patterns
+						if strings.Contains(errStr, "504") || strings.Contains(errStr, "timeout") {
+							waitTime = 60 * time.Second
+							if strings.Contains(ctl.Name, "Sectigo") {
+								waitTime = 120 * time.Second
+							}
+						} else if strings.Contains(errStr, "429") || 
+								(strings.Contains(errStr, "400") && strings.Contains(ctl.Name, "TrustAsia")) {
+							// Rate limiting - use exponential backoff
+							waitTime = tickerDuration * 2
+							if waitTime > 5*time.Minute {
+								waitTime = 5*time.Minute
+							}
+						}
+						
+						if r.options.Verbose {
+							fmt.Fprintf(os.Stderr, "Waiting %v before retrying %s\n", waitTime, ctl.Name)
+						}
+						
 						select {
 						case <-ctx.Done():
 							return
-						case <-time.After(30 * time.Second): // Wait with context awareness
+						case <-time.After(waitTime):
 						}
-						break // Break this loop on error, wait for the next ticker tick.
+						break // This should be INSIDE the if err != nil block
 					}
 
 					if len(entries.Entries) > 0 {
@@ -335,17 +421,45 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 				}
 				continue // Continue with the outer loop.
 			} else { // Non Google handler
-				entries, err := ctl.Client.GetRawEntries(ctx, start, end)
+				batchEnd := start + batchSize
+				if batchEnd > end {
+					batchEnd = end
+				}
+				entries, err := RetryGetEntries(ctx, ctl.Client, start, batchEnd, 3)
 				if err != nil {
 					if r.options.Verbose {
-						fmt.Fprintf(os.Stderr, "Error fetching entries for %s: %v", ctl.Name, err)
+						fmt.Fprintf(os.Stderr, "Error fetching entries for %s (%s): %v\n", ctl.Name, providerName, err)
 					}
+					
+					// Determine wait time based on error type and provider
+					waitTime := 30 * time.Second
+					errStr := strings.ToLower(err.Error())
+					
+					// Special handling for known error patterns
+					if strings.Contains(errStr, "504") || strings.Contains(errStr, "timeout") {
+						waitTime = 60 * time.Second
+						if strings.Contains(ctl.Name, "Sectigo") {
+							waitTime = 120 * time.Second
+						}
+					} else if strings.Contains(errStr, "429") || 
+							(strings.Contains(errStr, "400") && strings.Contains(ctl.Name, "TrustAsia")) {
+						// Rate limiting - use exponential backoff
+						waitTime = tickerDuration * 2
+						if waitTime > 5*time.Minute {
+							waitTime = 5*time.Minute
+						}
+					}
+					
+					if r.options.Verbose {
+						fmt.Fprintf(os.Stderr, "Waiting %v before retrying %s\n", waitTime, ctl.Name)
+					}
+					
 					select {
 					case <-ctx.Done():
 						return
-					case <-time.After(60 * time.Second): // Wait with context awareness
+					case <-time.After(waitTime):
 					}
-					continue
+					continue // Add this line to continue the outer loop
 				}
 
 				if len(entries.Entries) > 0 {
