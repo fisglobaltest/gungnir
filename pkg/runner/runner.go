@@ -14,13 +14,13 @@ import (
 	"syscall"
 	"time"
 	"github.com/anthdm/hollywood/actor"
-	"github.com/g0ldencybersec/gungnir/pkg/utils"
+	"github.com/fisglobaltest/gungnir/pkg/utils"
 	ct "github.com/google/certificate-transparency-go"
 	"github.com/google/certificate-transparency-go/x509"
 	"github.com/nats-io/nats.go"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/g0ldencybersec/gungnir/pkg/types"
+	"github.com/fisglobaltest/gungnir/pkg/types"
 )
 
 // Global variables
