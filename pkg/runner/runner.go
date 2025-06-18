@@ -236,7 +236,9 @@ func (r *Runner) Run() {
 	if r.watcher != nil {
 		r.watcher.Close()
 	}
-	r.natsConn.Close()
+	if r.natsConn != nil {
+		r.natsConn.Close()
+	}	
 	fmt.Fprintf(os.Stderr, "Gracefully shutdown all routines\n")
 }
 
@@ -278,8 +280,6 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 	if r.options.Verbose {
 		fmt.Fprintf(os.Stderr, "Starting scan for %s (%s)\n", ctl.Name, providerName)
 	}
-
-	tickerDuration := time.Second // Default duration
 	// Determine ticker duration based on log name or URL
 	tickerDuration := time.Second // Default duration
 	logNameLower := strings.ToLower(ctl.Name)
@@ -402,6 +402,7 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 					}
 					continue
 				}
+			}	
 
 			// Work with google logs
 			if IsGoogleLog {
