@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"crypto/tls"      // ADD THIS
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
@@ -10,13 +11,13 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
-
+	
 	"github.com/fisglobaltest/gungnir/pkg/types"
 	"github.com/google/certificate-transparency-go/loglist3"
 	"github.com/google/certificate-transparency-go/x509"
 	"github.com/google/uuid"
-
 	"github.com/google/certificate-transparency-go/client"
 	"github.com/google/certificate-transparency-go/jsonclient"
 )
