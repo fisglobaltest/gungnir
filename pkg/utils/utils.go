@@ -11,7 +11,6 @@ import (
 	"net/url"
 	"os"
 	"strings"
-	"sync"
 	"time"
 	
 	"github.com/fisglobaltest/gungnir/pkg/types"
