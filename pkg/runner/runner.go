@@ -357,7 +357,12 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 		break
 	}
 
-	start = end - 20
+	// After the initial STH fetch loop
+	if end > 20 {
+		start = end - 20
+	} else {
+		start = 0
+	}
 
 	for {
 		select {
@@ -411,7 +416,11 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 					if batchEnd > end {
 						batchEnd = end
 					}
-					entries, err := RetryGetEntries(ctx, ctl.Client, start, batchEnd, 3)
+					// Make sure we're not requesting invalid range
+					if start >= batchEnd {
+						break
+					}
+					entries, err := RetryGetEntries(ctx, ctl.Client, start, batchEnd-1, 3)  // Note: batchEnd-1
 					if err != nil {
 						if r.options.Verbose {
 							fmt.Fprintf(os.Stderr, "Error fetching entries for %s (%s): %v\n", ctl.Name, providerName, err)
@@ -476,7 +485,10 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 				if batchEnd > end {
 					batchEnd = end
 				}
-				entries, err := RetryGetEntries(ctx, ctl.Client, start, batchEnd, 3)
+				if start >= batchEnd {
+					continue // Skip this iteration if we've caught up
+				}
+				entries, err := RetryGetEntries(ctx, ctl.Client, start, batchEnd-1, 3)
 				if err != nil {
 					if r.options.Verbose {
 						fmt.Fprintf(os.Stderr, "Error fetching entries for %s (%s): %v\n", ctl.Name, providerName, err)
@@ -531,6 +543,8 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 						Index:   start,
 					}
 					start += int64(len(entries.Entries))
+				} else {// No entries returned, advance start to avoid infinite loop
+					start = batchEnd
 				}
 			}
 		}
